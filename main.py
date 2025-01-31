@@ -1,12 +1,13 @@
 import sys
 import base64
 import json
+import os
 
 import asyncio
 import dotenv
 import aiohttp
 
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
 dotenv.load_dotenv(".env")
@@ -26,8 +27,11 @@ async def get_token(
     elif not is_source_system and target_token:
         return target_token
 
-    base_url = os.getenv(f"{'SOURCE' if is_source_system else 'TARGET'}_BASE_QUERY_URL")
-    endpoint = f"{base_url}/erp-export-service/token"
+    base_url = os.getenv(f"{'SOURCE' if is_source_system else 'TARGET'}_WEBCLIENT_URL")
+
+    base_url = base_url.replace(".webclient", "")
+
+    endpoint = f"{base_url}/uaa/oauth/token"
 
     username = os.getenv(f"{'SOURCE' if is_source_system else 'TARGET'}_USERNAME")
     password = os.getenv(f"{'SOURCE' if is_source_system else 'TARGET'}_PASSWORD")
@@ -37,7 +41,7 @@ async def get_token(
         f"{'SOURCE' if is_source_system else 'TARGET'}_CLIENT_SECRET"
     )
 
-    async with session.get(
+    async with session.post(
         endpoint,
         data={
             "grant_type": "password",
@@ -51,6 +55,7 @@ async def get_token(
     ) as response:
         response.raise_for_status()
         token = (await response.json()).get("access_token")
+        token = f"Bearer {token}"
 
         if is_source_system:
             source_token = token
@@ -69,12 +74,12 @@ def get_route_ids(path: str) -> List[str]:
 async def export_route(
     route_id: str, session: aiohttp.ClientSession, failed_routes: List[Tuple[str, str]]
 ):
-    base_url = os.getenv("SOURCE_BASE_QUERY_URL")
+    base_url = os.getenv("SOURCE_WEBCLIENT_URL")
     endpoint = f"{base_url}/erp-export-service/exportRoutes/{route_id}"
 
     try:
         async with session.get(
-            endpoint, headers={"authorization": await get_token()}
+            endpoint, headers={"authorization": await get_token(session)}
         ) as response:
             response.raise_for_status()
             return await response.json()
@@ -83,51 +88,56 @@ async def export_route(
         return None
 
 
-async def import_route(message: dict, session: aiohttp.ClientSession) -> int:
-    base_url = os.getenv("TARGET_BASE_QUERY_URL")
+async def import_route(message: dict, session: aiohttp.ClientSession) -> Optional[int]:
+    base_url = os.getenv("TARGET_WEBCLIENT_URL")
     endpoint = f"{base_url}/erp-scheduler-service/importOrders/importRouteJobs"
 
-    # TODO: this might need to change to escaped JSON string
+    # uncomment for demo purposes
+    # message["exportMetadata"]['modelProperties'][0]['propertyValue'] += '_CRM3'
+
     escaped_message = json.dumps(message)
 
     data = dict(message=escaped_message, upgradeSegmentsDocument=False)
 
     try:
         async with session.post(
-            endpoint, headers={"authorization": await get_token()}, data=data
+            endpoint, headers={"accept": "application/json", "authorization": await get_token(session, False)}, json=data
         ) as response:
-            # FIXME: untested
-            return (await response.json()).get("jobId")
-    except aiohttp.ClientError as e:
-        failed_imports.append((message, str(e)))
-        return None
-
-
-async def check_route_import(job_id: int, session: aiohttp.ClientSession):
-    base_url = os.getenv("TARGET_BASE_QUERY_URL")
-    endpoint = f"{base_url}/erp-scheduler-service/importedJobs/{job_id}/message"
-
-    try:
-        async with session.get(
-            endpoint, headers={"authorization": await get_token()}
-        ) as response:
-            # TODO: check response in json
-            # if not 200, log message and job id or route id
             return await response.json()
     except aiohttp.ClientError as e:
-        failed_imports.append((message, str(e)))
+        print(json.dumps(message, indent=2), str(e))
         return None
+
+
+async def check_route_imports(job_ids: List[int], session: aiohttp.ClientSession):
+    base_url = os.getenv("TARGET_WEBCLIENT_URL")
+    endpoint = f"{base_url}/erp-scheduler-service/importOrders/importedJobs"
+    params = "&".join([f"jobIds={job_id}" for job_id in job_ids])
+    endpoint = f"{endpoint}?{params}"
+
+    async with session.get(
+        endpoint, headers={"authorization": await get_token(session, False)}
+    ) as response:
+        return await response.json()
 
 
 async def main(path: str):
     route_ids = get_route_ids(path)
 
-    failed_routes = []
+    if len(route_ids) == 0:
+        print(f"No route ids found in {path}")
+        return
+
+    failed_routes: List[Tuple[str, str]] = []
 
     async with aiohttp.ClientSession(raise_for_status=True) as session:
+
         export_tasks = [
             export_route(route_id, session, failed_routes) for route_id in route_ids
         ]
+
+        for route in failed_routes:
+            print(f'route failed: {route}')
 
         route_exports = await asyncio.gather(*export_tasks)
 
@@ -135,15 +145,40 @@ async def main(path: str):
             import_route(route_export, session) for route_export in route_exports
         ]
 
-        job_ids = await asyncio.gather(*import_tasks)
+        import_responses = await asyncio.gather(*import_tasks)
 
-        check_tasks = [
-            check_route_import(job_id, session) for job_id in job_ids
-        ]
+        job_ids = [response.get('jobId') for response in import_responses if response]
 
-        statuses = await asyncio.gather(*check_tasks)
+        if not job_ids:
+            print("Unable to find any job ids from import response, something might have gone wrong.")
+            return
 
-        print(statuses)
+        results = []
+
+        while retry_count := 0 < 5:
+            statuses = await check_route_imports(job_ids, session)
+
+            for response in statuses:
+                if response.get('responseCode'):
+                    results.append(response)
+                    job_ids.remove(response.get('jobId'))
+            
+            if len(job_ids) == 0:
+                break
+
+            await asyncio.sleep(1 * retry_count)
+            retry_count += 1
+        
+        if len(job_ids):
+            print(f"Unable to get status for job IDs {job_ids} jobs after 5 retries.")
+
+        failed_imports = [response for response in statuses if response.get('responseCode') != 200]
+
+        for failed_import in failed_imports:
+            print(f"{failed_import.get('responseCode')} - {failed_import.get('responseMessage')}")
+
+        if not len(failed_imports):
+            print("All routes imported successfully.")
 
 
 if __name__ == "__main__":
